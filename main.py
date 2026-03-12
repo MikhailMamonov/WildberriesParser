@@ -1,7 +1,8 @@
 from playwright.async_api import async_playwright
-
+import logging
 import pandas as pd
 import httpx
+import time
 from datetime import datetime
 from config import WBConfig
 import asyncio
@@ -10,6 +11,8 @@ import os
 from tqdm.asyncio import tqdm
 from typing import Optional, Tuple
 from pydantic import BaseModel, Field
+logger = logging.getLogger(__name__)
+logging.basicConfig(level= logging.ERROR)
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -84,8 +87,17 @@ class WBProduct(BaseModel):
             "country": self.country
         }
 
+class WBOption(BaseModel): 
+    name: str = ""
+    value: str = "" 
 
+class WBGroupedOption(BaseModel):
+    group_name: str = ""
+    options: list[WBOption] = Field(default_factory=list)
 
+class WBDetailProduct(BaseModel):
+    deescription: str = ""
+    grouped_options: list[WBGroupedOption] = Field(default_factory=list)
 
 
 class AsyncWBParser: 
@@ -135,6 +147,8 @@ class AsyncWBParser:
             try: 
                 resp = await self.client.get(self.SEARCH_URL, params=params)
                 if resp.status_code == 498:
+                    logger.warning(
+                        "token expired, refreshing (attempt %d)", attempt)
                     await self._refresh_token()
                     continue
                 if resp.status_code != 200:
@@ -143,6 +157,7 @@ class AsyncWBParser:
                 products = data.get("products", [])
                 return [WBProduct.model_validate(p) for p in products]
             except Exception as e:
+                logger.warning(f"Attempt {attempt} failed: {e}")
                 await asyncio.sleep(0.5)
         return [] 
     
@@ -156,6 +171,7 @@ class AsyncWBParser:
                 if len(products) == 0:
                     empty_pages_in_a_row+=1
                     if empty_pages_in_a_row>=max_empty:
+                        logger.info(f"Поиск завершен: {max_empty} пустых страниц подряд")
                         break
                 else:
                     empty_pages_in_a_row = 0
@@ -166,6 +182,72 @@ class AsyncWBParser:
                     break
                 await asyncio.sleep(0.2)
         return all_products
+    
+    async def get_detail_product(self, sku: int) -> Tuple[Optional[WBDetailProduct], str]:
+        vol, part = sku // 100000, sku // 1000
+        base_basket = self._get_basket_id(sku)
+        offsets = list(dict.fromkeys([i for j in range(15) for i in (j, -j)]))
+
+        for offset in offsets:
+            basket_str = f"{base_basket + offset:02d}"
+            url = f"https://basket-{basket_str}.wbcontent.net/vol{vol}/part{part}/{sku}/info/ru/card.json"
+            try:
+                res = await self.client.get(url, timeout=1)
+                if res.status_code == 200:
+                    return WBDetailProduct.model_validate(res.json()), basket_str
+            except:
+                continue
+        return None, ""
+    
+
+    def _get_basket_id(self,sku:int) -> str:
+        vol = sku // 100000
+        basket_ranges = [
+            (0, 143, 1),
+            (144, 287, 2),
+            (288, 431, 3),
+            (432, 719, 4),
+            (720, 1007, 5),
+            (1008, 1061, 6),
+            (1062, 1115, 7),
+            (1116, 1169, 8),
+            (1170, 1313, 9),
+            (1314, 1601, 10),
+            (1602, 1655, 11),
+            (1656, 1919, 12),
+            (1920, 2045, 13),
+            (2046, 2189, 14),
+            (2190, 2405, 15),
+            (2406, 2621, 16),
+            (2622, 2837, 17),
+            (2838, 3053, 18),
+            (3054, 3269, 19),
+            (3270, 3485, 20),
+            (3486, 3701, 21),
+            (3702, 3917, 22),
+            (3918, 4133, 23),
+            (4134, 4349, 24),
+            (4350, 4565, 25),
+            (4566, 4877, 26),
+            (4878, 5189, 27),
+            (5190, 5501, 28),
+            (5502, 5813, 29),
+            (5814, 6125, 30),
+            (6126, 6437, 31),
+            (6438, 6749, 32),
+            (6750, 7061, 33),
+            (7062, 7373, 34),
+            (7374, 7685, 35),
+            (7686, 7997, 36),
+            (7998, 8309, 37),
+            (8310, 8741, 38),
+            (8742, 9173, 39),
+        ]
+        for start, end, basket in basket_ranges: 
+            if start<= vol<= end:
+                return basket
+        
+        return 40
                  
 
 
@@ -215,7 +297,10 @@ async def main() -> int:
             "пальто из натуральной шерсти",
             5
         )
+
+        logger.info(f"Найдено товаров: {len(products)}")
     except Exception as e: 
+        logger.error(f"Ошибка при поиске товаров: {e}")
         await parser.close()
         return
     try:
@@ -223,12 +308,57 @@ async def main() -> int:
 
         async def worker(product: WBProduct):
             async with semaphore:
+                await asyncio.sleep(0.1)
+                detail, b_str = await parser.get_detail_product(product.sku) 
+                if detail: 
+                    product.generate_images(b_str)
+                    product.description = detail.deescription
+                    chars = []
+                    for group in detail.grouped_options:
+                        opts = [f"{o.name}: {o.value}" for o in group.options]
+                        if opts:
+                            chars.append(f"[{group.group_name}]\n" + "\n".join(opts))
+                            for o in group.options:
+                                if "Страна" in o.name:
+                                    product.country = o.value
+                    product.characteristics = "\n\n".join(chars)
+        start = time.perf_counter()
+        await tqdm.gather(*(worker(p) for p in products), desc="Обработка товаров", total=len(products))
+        end = time.perf_counter()
 
+        logger.info(f"Общее время выполнения: {end-start:.2f} секунд")
+        logger.info(f"Обработано товаров: {len(products)}")
+        final_data = [p.to_excel_dict() for p in products]
+    finally:
+        await parser.close()
+    column_mapping = {
+        "link": "Ссылка на товар",
+        "sku":"Артикул",
+        "name":"Название",
+        "price":"Цена",
+        "description": "Описание",
+        "image_urls":"Ссылки на изображения через запятую",
+        "characteristics": "Все характеристики с сохранением их структуры",
+        "seller_name":"Название селлера",
+        "seller_link":"Ссылка на селлера",
+        "sizes": "Размеры товара через запятую",
+        "total_stocks":"Остатки по товару(число)",
+        "rating":"Рейтинг",
+        "feedbacks":"Количество отзывов",
+        "country":"Страна производства"
+    }
 
-
-
-   
-    
+    df = pd.DataFrame(final_data).rename(columns=column_mapping)
+    print(df)
+    col_to_export = list(column_mapping.values())
+    df[col_to_export].to_excel("wb_detailed_data.xlsx", index=False)
+    filtered_df = df[
+        (df["Рейтинг"] >= 4.5) &
+        (df["Цена"]<= 10000) &
+        (df["Страна производства"].str.contains("Россия", case=False, na=False))
+    ]
+    if not filtered_df.empty:
+        filtered_df[col_to_export].to_excel("filtered_catalog.xlsx", index=False)   
 
 
 if __name__ == "__main__":
