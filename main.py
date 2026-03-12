@@ -4,7 +4,6 @@ import pandas as pd
 import httpx
 import time
 from datetime import datetime
-from config import WBConfig
 import asyncio
 import argparse
 import os
